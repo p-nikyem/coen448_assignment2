@@ -1,32 +1,5 @@
 
-
 services:
-  mongodb:
-    image: mongo:latest
-    container_name: mongo-container
-    hostname: mongodb
-    environment:
-      - MONGO_INITDB_DATABASE=${DATABASE_NAME}
-      - MONGO_INITDB_ROOT_USERNAME=${MONGO_USERNAME}
-      - MONGO_INITDB_ROOT_PASSWORD=${MONGO_PASSWORD}
-    ports:
-      - "27017:27017"
-    volumes:
-      - mongodb_data:/data/db
-  
-  mongodb-setup:
-    image: python:3.10-slim
-    container_name: mongo-setup
-    build:
-      context: .
-      dockerfile: src/shared/config/mongodb/Dockerfile
-    depends_on:
-      - mongodb
-    env_file:
-      - .env
-    links:
-      - mongodb
-      
   order-service:
     build:
       context: ./src
@@ -35,7 +8,7 @@ services:
     environment:
       - FLASK_APP=order_service.wsgi:app
       - FLASK_ENV=${FLASK_ENV}
-      - MONGO_URI=mongodb://${MONGO_USERNAME}:${MONGO_PASSWORD}@mongodb:27017/${DATABASE_NAME}?authSource=admin
+      - MONGO_URI=${MONGO_URI}
       - DATABASE_NAME=${DATABASE_NAME}
       - RABBITMQ_HOST=${RABBITMQ_HOST}
       - RABBITMQ_PORT=${RABBITMQ_PORT}
@@ -44,9 +17,7 @@ services:
       - RABBITMQ_QUEUE_NAME=${RABBITMQ_QUEUE_NAME}
     ports:
       - "5001:5000"
-    depends_on:
-      rabbitmq:
-          condition: service_healthy
+
 
   user-service-v1:
     build:
@@ -56,7 +27,7 @@ services:
     environment:
       - FLASK_APP=user_service_v1.wsgi:app
       - FLASK_ENV=${FLASK_ENV}
-      - MONGO_URI=mongodb://${MONGO_USERNAME}:${MONGO_PASSWORD}@mongodb:27017/${DATABASE_NAME}?authSource=admin
+      - MONGO_URI=${MONGO_URI}
       - DATABASE_NAME=${DATABASE_NAME}
       - RABBITMQ_HOST=${RABBITMQ_HOST}
       - RABBITMQ_PORT=${RABBITMQ_PORT}
@@ -65,9 +36,7 @@ services:
       - RABBITMQ_QUEUE_NAME=${RABBITMQ_QUEUE_NAME}
     ports:
       - "5002:5000"
-    depends_on:
-      rabbitmq:
-          condition: service_healthy
+
   
   user-service-v2:
     build:
@@ -77,7 +46,7 @@ services:
     environment:
       - FLASK_APP=user_service_v2.wsgi:app
       - FLASK_ENV=${FLASK_ENV}
-      - MONGO_URI=mongodb://${MONGO_USERNAME}:${MONGO_PASSWORD}@mongodb:27017/${DATABASE_NAME}?authSource=admin
+      - MONGO_URI=${MONGO_URI}
       - DATABASE_NAME=${DATABASE_NAME}
       - RABBITMQ_HOST=${RABBITMQ_HOST}
       - RABBITMQ_PORT=${RABBITMQ_PORT}
@@ -86,30 +55,8 @@ services:
       - RABBITMQ_QUEUE_NAME=${RABBITMQ_QUEUE_NAME}
     ports:
       - "5003:5000"
-    depends_on:
-      rabbitmq:
-          condition: service_healthy
-  
-  rabbitmq:
-    image: rabbitmq:3-management
-    container_name: rabbitmq-container
-    hostname: rabbitmq
-    ports:
-      - "5673:5673" # RabbitMQ messaging port
-      - "15672:15672" # RabbitMQ management UI
-    expose:
-      - 5673
-      - 15672
-    environment:
-      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
-      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
-      RABBITMQ_NODE_PORT: 5673 # had to change the default port because of a conflict with the mongodb port 
-    healthcheck:
-      test: rabbitmq-diagnostics check_port_connectivity
-      interval: 10s
-      timeout: 30s
-      retries: 3
 
+  
   kong:
     image: kong:latest
     container_name: api-gateway
@@ -144,6 +91,3 @@ services:
       - NODE_ENV=production
     ports:
       - "1337:1337"
-
-volumes:
-  mongodb_data:
