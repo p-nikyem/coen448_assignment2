@@ -1,28 +1,208 @@
-name: CI/CD Pipeline
+name: Integration Tests CI
 
 on:
   push:
-    branches:
-      - main  # Change to your default branch if different
+    branches: [main]
+  pull_request:
+    branches: [main]
 
 jobs:
-  deploy:
+  integration-tests:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v3
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      - name: Set up SSH
-        uses: webfactory/ssh-agent@v0.7.0
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          ssh-private-key: ${{ secrets.EC2_SSH_KEY }}
+          python-version: "3.10"
 
-      - name: Add Known Hosts
-        run: |
-          mkdir -p ~/.ssh
-          ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+      - name: Install test dependencies
+        run: pip install -r requirements.txt
 
-      - name: Deploy to EC2
+      - name: Create .env file
+        env:
+          MONGO_URI: ${{ secrets.MONGO_URI }}
+          MONGO_USERNAME: ${{ secrets.MONGO_USERNAME }}
+          MONGO_PASSWORD: ${{ secrets.MONGO_PASSWORD }}
         run: |
-          ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} 'bash ~/deploy.sh'
+          cat > .env << EOF
+          FLASK_APP=wsgi.py
+          FLASK_RUN_PORT=5000
+          FLASK_RUN_HOST=0.0.0.0
+          FLASK_ENV=development
+          P_VALUE=100
+          RABBITMQ_HOST=rabbitmq
+          RABBITMQ_PORT=5673
+          RABBITMQ_USER=guest
+          RABBITMQ_PASSWORD=guest
+          RABBITMQ_QUEUE_NAME=user_updates
+          RABBITMQ_USER_USER=guest
+          RABBITMQ_USER_PASSWORD=guest
+          RABBITMQ_ORDER_USER=guest
+          RABBITMQ_ORDER_PASSWORD=guest
+          DATABASE_NAME=aware_microservices
+          MONGO_USERNAME=${MONGO_USERNAME}
+          MONGO_PASSWORD=${MONGO_PASSWORD}
+          MONGO_URI=${MONGO_URI}
+          EOF
+
+      - name: Create CI docker-compose override
+        run: |
+          cat > docker-compose.ci.yml << 'EOF'
+          services:
+            rabbitmq:
+              image: rabbitmq:3-management
+              container_name: rabbitmq-ci
+              hostname: rabbitmq
+              ports:
+                - "5673:5673"
+                - "15672:15672"
+              environment:
+                RABBITMQ_DEFAULT_USER: guest
+                RABBITMQ_DEFAULT_PASS: guest
+                RABBITMQ_NODE_PORT: 5673
+              healthcheck:
+                test: rabbitmq-diagnostics check_port_connectivity
+                interval: 10s
+                timeout: 30s
+                retries: 3
+
+            order-service:
+              build:
+                context: ./src
+                dockerfile: order_service/Dockerfile
+              container_name: order-service
+              environment:
+                - FLASK_APP=order_service.wsgi:app
+                - FLASK_ENV=${FLASK_ENV}
+                - MONGO_URI=${MONGO_URI}
+                - DATABASE_NAME=${DATABASE_NAME}
+                - RABBITMQ_HOST=rabbitmq
+                - RABBITMQ_PORT=5673
+                - RABBITMQ_USER=${RABBITMQ_ORDER_USER}
+                - RABBITMQ_PASSWORD=${RABBITMQ_ORDER_PASSWORD}
+                - RABBITMQ_QUEUE_NAME=${RABBITMQ_QUEUE_NAME}
+              ports:
+                - "5001:5000"
+              depends_on:
+                rabbitmq:
+                  condition: service_healthy
+
+            user-service-v1:
+              build:
+                context: ./src
+                dockerfile: user_service_v1/Dockerfile
+              container_name: user-service-v1
+              environment:
+                - FLASK_APP=user_service_v1.wsgi:app
+                - FLASK_ENV=${FLASK_ENV}
+                - MONGO_URI=${MONGO_URI}
+                - DATABASE_NAME=${DATABASE_NAME}
+                - RABBITMQ_HOST=rabbitmq
+                - RABBITMQ_PORT=5673
+                - RABBITMQ_USER=${RABBITMQ_USER_USER}
+                - RABBITMQ_PASSWORD=${RABBITMQ_USER_PASSWORD}
+                - RABBITMQ_QUEUE_NAME=${RABBITMQ_QUEUE_NAME}
+              ports:
+                - "5002:5000"
+              depends_on:
+                rabbitmq:
+                  condition: service_healthy
+
+            user-service-v2:
+              build:
+                context: ./src
+                dockerfile: user_service_v2/Dockerfile
+              container_name: user-service-v2
+              environment:
+                - FLASK_APP=user_service_v2.wsgi:app
+                - FLASK_ENV=${FLASK_ENV}
+                - MONGO_URI=${MONGO_URI}
+                - DATABASE_NAME=${DATABASE_NAME}
+                - RABBITMQ_HOST=rabbitmq
+                - RABBITMQ_PORT=5673
+                - RABBITMQ_USER=${RABBITMQ_USER_USER}
+                - RABBITMQ_PASSWORD=${RABBITMQ_USER_PASSWORD}
+                - RABBITMQ_QUEUE_NAME=${RABBITMQ_QUEUE_NAME}
+              ports:
+                - "5003:5000"
+              depends_on:
+                rabbitmq:
+                  condition: service_healthy
+
+            kong:
+              image: kong:latest
+              container_name: api-gateway
+              build:
+                context: ./src/api_gateway
+                dockerfile: Dockerfile
+                args:
+                  - P_VALUE=${P_VALUE}
+              environment:
+                - KONG_DATABASE=off
+                - KONG_DECLARATIVE_CONFIG=/etc/kong/kong.yml
+                - KONG_PROXY_ACCESS_LOG=/dev/stdout
+                - KONG_ADMIN_ACCESS_LOG=/dev/stdout
+                - KONG_PROXY_ERROR_LOG=/dev/stderr
+                - KONG_ADMIN_ERROR_LOG=/dev/stderr
+                - KONG_ADMIN_LISTEN=0.0.0.0:8001
+                - KONG_PROXY_LISTEN=0.0.0.0:8000
+                - P_VALUE=${P_VALUE}
+              ports:
+                - "8000:8000"
+                - "8001:8001"
+              depends_on:
+                - order-service
+                - user-service-v1
+          EOF
+
+      - name: Build and start services
+        run: docker compose -f docker-compose.ci.yml --env-file .env up --build -d
+
+      - name: Wait for Kong to be ready
+        run: |
+          echo "Waiting for Kong..."
+          for i in $(seq 1 60); do
+            if curl -s http://localhost:8001/ > /dev/null 2>&1; then
+              echo "Kong is ready!"
+              break
+            fi
+            echo "Attempt $i/60..."
+            sleep 2
+          done
+
+      - name: Wait for services to stabilize
+        run: sleep 5
+
+      - name: Show running containers
+        run: docker ps
+
+      - name: Run integration tests (TC_01, TC_02, TC_03)
+        env:
+          MONGO_URI: ${{ secrets.MONGO_URI }}
+          DATABASE_NAME: aware_microservices
+        run: |
+          python -m pytest tests/test_integration_a2.py -v \
+            -k "not TestTC04" \
+            --tb=short
+
+      - name: Run gateway routing tests (TC_04)
+        env:
+          MONGO_URI: ${{ secrets.MONGO_URI }}
+          DATABASE_NAME: aware_microservices
+        run: |
+          python -m pytest tests/test_integration_a2.py -v \
+            -k "TestTC04" \
+            --tb=short
+
+      - name: Show service logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.ci.yml logs
+
+      - name: Cleanup
+        if: always()
+        run: docker compose -f docker-compose.ci.yml down -v
