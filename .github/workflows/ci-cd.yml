@@ -7,9 +7,9 @@ on:
     branches: [main]
 
 jobs:
-  integration-tests:
+  integration-tests-tc01-tc03:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
 
     steps:
       - name: Checkout code
@@ -24,10 +24,6 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Create .env file
-        env:
-          MONGO_URI: ${{ secrets.MONGO_URI }}
-          MONGO_USERNAME: ${{ secrets.MONGO_USERNAME }}
-          MONGO_PASSWORD: ${{ secrets.MONGO_PASSWORD }}
         run: |
           cat > .env << EOF
           FLASK_APP=wsgi.py
@@ -45,14 +41,14 @@ jobs:
           RABBITMQ_ORDER_USER=guest
           RABBITMQ_ORDER_PASSWORD=guest
           DATABASE_NAME=aware_microservices
-          MONGO_USERNAME=${MONGO_USERNAME}
-          MONGO_PASSWORD=${MONGO_PASSWORD}
-          MONGO_URI=${MONGO_URI}
+          MONGO_USERNAME=${{ secrets.MONGO_USERNAME }}
+          MONGO_PASSWORD=${{ secrets.MONGO_PASSWORD }}
+          MONGO_URI=${{ secrets.MONGO_URI }}
           EOF
 
-      - name: Create CI docker-compose override
+      - name: Create CI docker-compose
         run: |
-          cat > docker-compose.ci.yml << 'EOF'
+          cat > docker-compose.ci.yml << 'DCEOF'
           services:
             rabbitmq:
               image: rabbitmq:3-management
@@ -158,30 +154,22 @@ jobs:
               depends_on:
                 - order-service
                 - user-service-v1
-          EOF
+          DCEOF
 
       - name: Build and start services
         run: docker compose -f docker-compose.ci.yml --env-file .env up --build -d
 
-      - name: Wait for Kong to be ready
+      - name: Wait for Kong
         run: |
-          echo "Waiting for Kong..."
           for i in $(seq 1 60); do
-            if curl -s http://localhost:8001/ > /dev/null 2>&1; then
-              echo "Kong is ready!"
-              break
-            fi
-            echo "Attempt $i/60..."
-            sleep 2
+            curl -s http://localhost:8001/ > /dev/null 2>&1 && echo "Kong ready" && break
+            echo "Waiting... $i/60"; sleep 2
           done
 
       - name: Wait for services to stabilize
         run: sleep 5
 
-      - name: Show running containers
-        run: docker ps
-
-      - name: Run integration tests (TC_01, TC_02, TC_03)
+      - name: Run TC_01, TC_02, TC_03
         env:
           MONGO_URI: ${{ secrets.MONGO_URI }}
           DATABASE_NAME: aware_microservices
@@ -190,19 +178,246 @@ jobs:
             -k "not TestTC04" \
             --tb=short
 
-      - name: Run gateway routing tests (TC_04)
-        env:
-          MONGO_URI: ${{ secrets.MONGO_URI }}
-          DATABASE_NAME: aware_microservices
-        run: |
-          python -m pytest tests/test_integration_a2.py -v \
-            -k "TestTC04" \
-            --tb=short
-
-      - name: Show service logs on failure
+      - name: Show logs on failure
         if: failure()
         run: docker compose -f docker-compose.ci.yml logs
 
       - name: Cleanup
         if: always()
         run: docker compose -f docker-compose.ci.yml down -v
+
+  tc04-gateway-routing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: integration-tests-tc01-tc03
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install test dependencies
+        run: pip install -r requirements.txt
+
+      - name: Create CI docker-compose
+        run: |
+          cat > docker-compose.ci.yml << 'DCEOF'
+          services:
+            rabbitmq:
+              image: rabbitmq:3-management
+              container_name: rabbitmq-ci
+              hostname: rabbitmq
+              ports:
+                - "5673:5673"
+                - "15672:15672"
+              environment:
+                RABBITMQ_DEFAULT_USER: guest
+                RABBITMQ_DEFAULT_PASS: guest
+                RABBITMQ_NODE_PORT: 5673
+              healthcheck:
+                test: rabbitmq-diagnostics check_port_connectivity
+                interval: 10s
+                timeout: 30s
+                retries: 3
+
+            order-service:
+              build:
+                context: ./src
+                dockerfile: order_service/Dockerfile
+              container_name: order-service
+              environment:
+                - FLASK_APP=order_service.wsgi:app
+                - FLASK_ENV=development
+                - MONGO_URI=${MONGO_URI}
+                - DATABASE_NAME=aware_microservices
+                - RABBITMQ_HOST=rabbitmq
+                - RABBITMQ_PORT=5673
+                - RABBITMQ_USER=guest
+                - RABBITMQ_PASSWORD=guest
+                - RABBITMQ_QUEUE_NAME=user_updates
+              ports:
+                - "5001:5000"
+              depends_on:
+                rabbitmq:
+                  condition: service_healthy
+
+            user-service-v1:
+              build:
+                context: ./src
+                dockerfile: user_service_v1/Dockerfile
+              container_name: user-service-v1
+              environment:
+                - FLASK_APP=user_service_v1.wsgi:app
+                - FLASK_ENV=development
+                - MONGO_URI=${MONGO_URI}
+                - DATABASE_NAME=aware_microservices
+                - RABBITMQ_HOST=rabbitmq
+                - RABBITMQ_PORT=5673
+                - RABBITMQ_USER=guest
+                - RABBITMQ_PASSWORD=guest
+                - RABBITMQ_QUEUE_NAME=user_updates
+              ports:
+                - "5002:5000"
+              depends_on:
+                rabbitmq:
+                  condition: service_healthy
+
+            user-service-v2:
+              build:
+                context: ./src
+                dockerfile: user_service_v2/Dockerfile
+              container_name: user-service-v2
+              environment:
+                - FLASK_APP=user_service_v2.wsgi:app
+                - FLASK_ENV=development
+                - MONGO_URI=${MONGO_URI}
+                - DATABASE_NAME=aware_microservices
+                - RABBITMQ_HOST=rabbitmq
+                - RABBITMQ_PORT=5673
+                - RABBITMQ_USER=guest
+                - RABBITMQ_PASSWORD=guest
+                - RABBITMQ_QUEUE_NAME=user_updates
+              ports:
+                - "5003:5000"
+              depends_on:
+                rabbitmq:
+                  condition: service_healthy
+
+            kong:
+              image: kong:latest
+              container_name: api-gateway
+              build:
+                context: ./src/api_gateway
+                dockerfile: Dockerfile
+                args:
+                  - P_VALUE=${P_VALUE}
+              environment:
+                - KONG_DATABASE=off
+                - KONG_DECLARATIVE_CONFIG=/etc/kong/kong.yml
+                - KONG_PROXY_ACCESS_LOG=/dev/stdout
+                - KONG_ADMIN_ACCESS_LOG=/dev/stdout
+                - KONG_PROXY_ERROR_LOG=/dev/stderr
+                - KONG_ADMIN_ERROR_LOG=/dev/stderr
+                - KONG_ADMIN_LISTEN=0.0.0.0:8001
+                - KONG_PROXY_LISTEN=0.0.0.0:8000
+                - P_VALUE=${P_VALUE}
+              ports:
+                - "8000:8000"
+                - "8001:8001"
+              depends_on:
+                - order-service
+                - user-service-v1
+          DCEOF
+
+      - name: "TC_04 Scenario A: P_VALUE=100 (all traffic to v1)"
+        env:
+          MONGO_URI: ${{ secrets.MONGO_URI }}
+          P_VALUE: "100"
+        run: |
+          echo "Starting services with P_VALUE=100..."
+          docker compose -f docker-compose.ci.yml up --build -d
+          for i in $(seq 1 60); do
+            curl -s http://localhost:8001/ > /dev/null 2>&1 && break; sleep 2
+          done
+          sleep 5
+
+          echo "Sending 10 user creation requests..."
+          PASS=0; FAIL=0
+          for i in $(seq 1 10); do
+            RESP=$(curl -s -o /tmp/resp.json -w "%{http_code}" -X POST http://localhost:8000/users/ \
+              -H "Content-Type: application/json" \
+              -d "{\"emails\": [\"tc04a_${i}_$(date +%s%N)@test.com\"], \"deliveryAddress\": {\"street\": \"300 University St\", \"city\": \"Montreal\", \"state\": \"QC\", \"postalCode\": \"H3A2A7\", \"country\": \"Canada\"}}")
+            if [ "$RESP" = "201" ]; then
+              CREATED_AT=$(cat /tmp/resp.json | python3 -c "import sys,json; print(json.load(sys.stdin).get('createdAt','None'))")
+              if [ "$CREATED_AT" = "None" ]; then
+                PASS=$((PASS+1))
+                echo "  Request $i -> v1 (no createdAt) ✓"
+              else
+                FAIL=$((FAIL+1))
+                echo "  Request $i -> v2 (has createdAt) ✗"
+              fi
+            else
+              echo "  Request $i -> HTTP $RESP (failed)"
+            fi
+          done
+          echo "Results: $PASS/10 to v1, $FAIL/10 to v2"
+          docker compose -f docker-compose.ci.yml down -v
+          [ "$PASS" -ge 8 ] && [ "$FAIL" -eq 0 ] || (echo "FAIL: Expected all traffic to v1" && exit 1)
+
+      - name: "TC_04 Scenario B: P_VALUE=0 (all traffic to v2)"
+        env:
+          MONGO_URI: ${{ secrets.MONGO_URI }}
+          P_VALUE: "0"
+        run: |
+          echo "Starting services with P_VALUE=0..."
+          docker compose -f docker-compose.ci.yml up --build -d
+          for i in $(seq 1 60); do
+            curl -s http://localhost:8001/ > /dev/null 2>&1 && break; sleep 2
+          done
+          sleep 5
+
+          echo "Sending 10 user creation requests..."
+          V1=0; V2=0
+          for i in $(seq 1 10); do
+            RESP=$(curl -s -o /tmp/resp.json -w "%{http_code}" -X POST http://localhost:8000/users/ \
+              -H "Content-Type: application/json" \
+              -d "{\"emails\": [\"tc04b_${i}_$(date +%s%N)@test.com\"], \"deliveryAddress\": {\"street\": \"300 University St\", \"city\": \"Montreal\", \"state\": \"QC\", \"postalCode\": \"H3A2A7\", \"country\": \"Canada\"}}")
+            if [ "$RESP" = "201" ]; then
+              CREATED_AT=$(cat /tmp/resp.json | python3 -c "import sys,json; print(json.load(sys.stdin).get('createdAt','None'))")
+              if [ "$CREATED_AT" = "None" ]; then
+                V1=$((V1+1))
+                echo "  Request $i -> v1 (no createdAt) ✗"
+              else
+                V2=$((V2+1))
+                echo "  Request $i -> v2 (has createdAt) ✓"
+              fi
+            else
+              echo "  Request $i -> HTTP $RESP (failed)"
+            fi
+          done
+          echo "Results: $V1/10 to v1, $V2/10 to v2"
+          docker compose -f docker-compose.ci.yml down -v
+          [ "$V1" -eq 0 ] && [ "$V2" -ge 8 ] || (echo "FAIL: Expected all traffic to v2" && exit 1)
+
+      - name: "TC_04 Scenario C: P_VALUE=50 (50/50 split)"
+        env:
+          MONGO_URI: ${{ secrets.MONGO_URI }}
+          P_VALUE: "50"
+        run: |
+          echo "Starting services with P_VALUE=50..."
+          docker compose -f docker-compose.ci.yml up --build -d
+          for i in $(seq 1 60); do
+            curl -s http://localhost:8001/ > /dev/null 2>&1 && break; sleep 2
+          done
+          sleep 5
+
+          echo "Sending 20 user creation requests..."
+          V1=0; V2=0
+          for i in $(seq 1 20); do
+            RESP=$(curl -s -o /tmp/resp.json -w "%{http_code}" -X POST http://localhost:8000/users/ \
+              -H "Content-Type: application/json" \
+              -d "{\"emails\": [\"tc04c_${i}_$(date +%s%N)@test.com\"], \"deliveryAddress\": {\"street\": \"300 University St\", \"city\": \"Montreal\", \"state\": \"QC\", \"postalCode\": \"H3A2A7\", \"country\": \"Canada\"}}")
+            if [ "$RESP" = "201" ]; then
+              CREATED_AT=$(cat /tmp/resp.json | python3 -c "import sys,json; print(json.load(sys.stdin).get('createdAt','None'))")
+              if [ "$CREATED_AT" = "None" ]; then
+                V1=$((V1+1))
+                echo "  Request $i -> v1 (no createdAt)"
+              else
+                V2=$((V2+1))
+                echo "  Request $i -> v2 (has createdAt)"
+              fi
+            else
+              echo "  Request $i -> HTTP $RESP (failed)"
+            fi
+          done
+          echo "Results: $V1/20 to v1, $V2/20 to v2"
+          docker compose -f docker-compose.ci.yml down -v
+          [ "$V1" -ge 4 ] && [ "$V2" -ge 4 ] || (echo "FAIL: Expected roughly 50/50 split" && exit 1)
+
+      - name: Show logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.ci.yml logs 2>/dev/null || true
