@@ -3,45 +3,69 @@ COEN 448 Assignment 2 - Task 3: Integration Tests
 Tests TC_01 through TC_04 as defined in Task 2.
 
 Run with: python -m pytest tests/test_integration_a2.py -v
-(Services must already be running via docker compose on VM1, RabbitMQ on VM2)
-
-These tests require externally running services (Kong, RabbitMQ, MongoDB) and the
-MONGO_URI environment variable. They are skipped automatically when those
-prerequisites are absent.
+(Services must already be running via docker-compose on VM1, RabbitMQ on VM2)
 """
 
 import os
 import time
 import uuid
+import subprocess
+import shutil
 import pytest
 import requests
 import pymongo
 from dotenv import load_dotenv
+from datetime import datetime, timezone
 
 load_dotenv()
 
-GATEWAY_URL = "http://localhost:8000"
-MONGO_URI = os.getenv("MONGO_URI")
-
 # ---------------------------------------------------------------------------
-# Module-level skip guard
+# Skip if services are not available
 # ---------------------------------------------------------------------------
 
-def _gateway_reachable(url: str, timeout: int = 5) -> bool:
-    """Return True if the Kong gateway responds within *timeout* seconds."""
+def _services_available():
+    """Check if Kong and MongoDB are reachable."""
     try:
-        requests.get(url, timeout=timeout)
+        requests.get("http://localhost:8001/", timeout=3)
+        client = pymongo.MongoClient(os.getenv("MONGO_URI"), serverSelectionTimeoutMS=3000)
+        client.server_info()
+        client.close()
         return True
     except Exception:
         return False
 
-
-# Skip the entire module when prerequisites are missing so that a plain
-# `pytest` run on a developer machine / CI without services does not fail.
 pytestmark = pytest.mark.skipif(
-    not MONGO_URI or not _gateway_reachable(GATEWAY_URL),
-    reason="Integration prerequisites not met: MONGO_URI unset or Kong gateway unreachable",
+    not os.getenv("MONGO_URI") or not _services_available(),
+    reason="Services not running or MONGO_URI not set"
 )
+
+# ---------------------------------------------------------------------------
+# Detect docker compose command
+# ---------------------------------------------------------------------------
+
+def _docker_compose_cmd():
+    """Return the correct docker compose command for this system."""
+    if shutil.which("docker-compose"):
+        return ["docker-compose"]
+    return ["docker", "compose"]
+
+COMPOSE = _docker_compose_cmd()
+
+# ---------------------------------------------------------------------------
+# Helper: poll MongoDB until condition is met or timeout
+# ---------------------------------------------------------------------------
+
+def wait_for_condition(check_fn, timeout=15, interval=1):
+    """Poll check_fn() until it returns True or timeout is reached."""
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            if check_fn():
+                return True
+        except Exception:
+            pass
+        time.sleep(interval)
+    return False
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -50,36 +74,16 @@ pytestmark = pytest.mark.skipif(
 @pytest.fixture(scope="module")
 def api_url():
     """Kong API Gateway base URL."""
-    return GATEWAY_URL
+    return "http://localhost:8000"
 
 
 @pytest.fixture(scope="module")
 def mongo():
     """MongoDB Atlas connection. Yields (users_collection, orders_collection)."""
-    client = pymongo.MongoClient(MONGO_URI)
+    client = pymongo.MongoClient(os.getenv("MONGO_URI"))
     db = client[os.getenv("DATABASE_NAME", "aware_microservices")]
     yield db["users"], db["orders"]
     client.close()
-
-
-def _poll_mongo(collection, query: dict, expected: dict, timeout: int = 30, interval: float = 1.0):
-    """
-    Poll *collection* for *query* until the returned document matches
-    *expected* (subset check) or *timeout* seconds elapse.
-
-    Raises AssertionError with a diagnostic message on timeout.
-    """
-    deadline = time.time() + timeout
-    last_doc = None
-    while time.time() < deadline:
-        last_doc = collection.find_one(query)
-        if last_doc and all(last_doc.get(k) == v for k, v in expected.items()):
-            return last_doc
-        time.sleep(interval)
-    raise AssertionError(
-        f"Timed out after {timeout}s waiting for {expected}. "
-        f"Last document: {last_doc}"
-    )
 
 
 @pytest.fixture(scope="module")
@@ -136,7 +140,6 @@ class TestTC01UserCreation:
         """Step 3: Response contains a system-generated userId in UUID format."""
         user_id = created_user["userId"]
         assert user_id is not None
-        # Validate UUID format (8-4-4-4-12 hex chars)
         parts = user_id.split("-")
         assert len(parts) == 5, f"userId is not UUID format: {user_id}"
 
@@ -255,20 +258,22 @@ class TestTC03EventPropagation:
         # Verify response contains old and new data
         result = resp.json()
         assert isinstance(result, list), "Response should be a list of [old_user, new_user]"
-        old_user, new_user = result[0], result[1]
+        new_user = result[1]
         assert new_user["emails"] == [new_email]
 
         # Verify user updated in MongoDB
         db_user = users_col.find_one({"userId": user_id})
         assert db_user["emails"] == [new_email], "User email not updated in MongoDB"
 
-        # Poll MongoDB until the RabbitMQ event has propagated to the order
-        _poll_mongo(
-            orders_col,
-            {"orderId": created_order["orderId"]},
-            {"userEmails": [new_email]},
-            timeout=30,
+        # Poll for RabbitMQ event propagation instead of fixed sleep
+        order_id = created_order["orderId"]
+        propagated = wait_for_condition(
+            lambda: orders_col.find_one({"orderId": order_id}).get("userEmails") == [new_email],
+            timeout=15
         )
+        assert propagated, \
+            f"Order email not propagated within timeout. " \
+            f"Got: {orders_col.find_one({'orderId': order_id}).get('userEmails')}"
 
     def test_update_user_address_propagates_to_orders(self, api_url, created_user, created_order, mongo):
         """Steps 7-9: Update user address and verify it propagates to orders via RabbitMQ."""
@@ -294,13 +299,15 @@ class TestTC03EventPropagation:
         db_user = users_col.find_one({"userId": user_id})
         assert db_user["deliveryAddress"]["street"] == "500 Boulevard Rene-Levesque"
 
-        # Poll MongoDB until the RabbitMQ event has propagated to the order
-        _poll_mongo(
-            orders_col,
-            {"orderId": created_order["orderId"]},
-            {"deliveryAddress": new_address},
-            timeout=30,
+        # Poll for RabbitMQ event propagation
+        order_id = created_order["orderId"]
+        propagated = wait_for_condition(
+            lambda: orders_col.find_one({"orderId": order_id}).get("deliveryAddress", {}).get("street") == "500 Boulevard Rene-Levesque",
+            timeout=15
         )
+        assert propagated, \
+            f"Order address not propagated within timeout. " \
+            f"Got: {orders_col.find_one({'orderId': order_id}).get('deliveryAddress', {}).get('street')}"
 
 
 # ---------------------------------------------------------------------------
@@ -311,79 +318,70 @@ class TestTC03EventPropagation:
 class TestTC04GatewayRouting:
     """TC_04: Validate API Gateway Routing between v1 and v2."""
 
+    PROJECT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+    ENV_PATH = os.path.join(PROJECT_DIR, ".env")
+
+    @pytest.fixture(autouse=True)
+    def _restore_p_value(self):
+        """Save original P_VALUE and restore it after each test, even on failure."""
+        original = self._read_p_value()
+        yield
+        try:
+            self._set_p_value(original)
+            self._rebuild_and_restart_kong()
+        except Exception as e:
+            print(f"Warning: Failed to restore P_VALUE: {e}")
+
     def _read_p_value(self):
-        """Read the current P_VALUE from .env (or environment), defaulting to 100."""
-        # Prefer the live environment variable if set
-        env_val = os.getenv("P_VALUE")
-        if env_val is not None:
-            return int(env_val)
-        project_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-        env_path = os.path.join(project_dir, ".env")
-        if os.path.exists(env_path):
-            with open(env_path, "r") as f:
-                for line in f:
-                    if line.startswith("P_VALUE="):
-                        return int(line.strip().split("=", 1)[1])
-        return 100
+        """Read current P_VALUE from .env."""
+        if not os.path.exists(self.ENV_PATH):
+            return "100"
+        with open(self.ENV_PATH, "r") as f:
+            for line in f:
+                if line.startswith("P_VALUE="):
+                    return line.strip().split("=", 1)[1]
+        return "100"
 
-    def _rebuild_kong(self, p_value):
-        """Helper: update P_VALUE, rebuild and restart Kong."""
-        import subprocess
-
-        # Update .env P_VALUE (fall back to .env.example if .env is absent)
-        project_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-        env_path = os.path.join(project_dir, ".env")
-        env_example_path = os.path.join(project_dir, ".env.example")
-
-        if not os.path.exists(env_path) and os.path.exists(env_example_path):
-            import shutil
-            shutil.copy(env_example_path, env_path)
-
-        with open(env_path, "r") as f:
+    def _set_p_value(self, value):
+        """Write P_VALUE to .env file."""
+        if not os.path.exists(self.ENV_PATH):
+            pytest.skip(".env file not found — required for gateway routing tests")
+        with open(self.ENV_PATH, "r") as f:
             lines = f.readlines()
-        with open(env_path, "w") as f:
-            found = False
+        with open(self.ENV_PATH, "w") as f:
             for line in lines:
                 if line.startswith("P_VALUE="):
-                    f.write(f"P_VALUE={p_value}\n")
-                    found = True
+                    f.write(f"P_VALUE={value}\n")
                 else:
                     f.write(line)
-            if not found:
-                f.write(f"P_VALUE={p_value}\n")
 
-        # Rebuild and restart Kong using docker compose (v2)
+    def _rebuild_and_restart_kong(self):
+        """Rebuild and restart Kong with current .env settings."""
         subprocess.run(
-            ["docker", "compose", "build", "kong"],
-            cwd=project_dir, check=True, capture_output=True
+            COMPOSE + ["build", "kong"],
+            cwd=self.PROJECT_DIR, check=True, capture_output=True
         )
         subprocess.run(
-            ["docker", "compose", "up", "-d", "kong"],
-            cwd=project_dir, check=True, capture_output=True
+            COMPOSE + ["up", "-d", "kong"],
+            cwd=self.PROJECT_DIR, check=True, capture_output=True
         )
-        # Wait for Kong to be ready
-        time.sleep(10)
+        # Poll until Kong is ready instead of fixed sleep
+        ready = wait_for_condition(
+            lambda: requests.get("http://localhost:8001/", timeout=2).status_code == 200,
+            timeout=30
+        )
+        assert ready, "Kong did not become ready within 30 seconds"
 
-    def _clear_logs(self):
-        """Record a timestamp to use as the --since boundary for subsequent log reads."""
-        # Return current UTC timestamp in a format accepted by `docker compose logs --since`
-        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-    def _get_logs(self, service, since=None):
-        """Get logs for a service, optionally starting from *since* timestamp."""
-        import subprocess
-        project_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-        cmd = ["docker", "compose", "logs", "--tail=200", service]
-        if since:
-            cmd += ["--since", since]
+    def _get_logs_since(self, service, since_time):
+        """Get logs for a service since a specific timestamp."""
         result = subprocess.run(
-            cmd,
-            cwd=project_dir, capture_output=True, text=True, check=True
+            COMPOSE + ["logs", "--since", since_time, service],
+            cwd=self.PROJECT_DIR, capture_output=True, text=True
         )
         return result.stdout
 
     def _send_user_requests(self, api_url, count):
-        """Send N user creation requests with unique emails."""
+        """Send N user creation requests with unique emails. Returns list of responses."""
         responses = []
         for i in range(count):
             payload = {
@@ -403,75 +401,69 @@ class TestTC04GatewayRouting:
 
     def test_scenario_a_all_traffic_to_v1(self, api_url):
         """Scenario A: P_VALUE=100 -> all traffic to v1."""
-        original_p = self._read_p_value()
-        try:
-            self._rebuild_kong(100)
-            since = self._clear_logs()
+        self._set_p_value(100)
+        self._rebuild_and_restart_kong()
 
-            responses = self._send_user_requests(api_url, 10)
-            assert len(responses) == 10, f"Expected 10 successful creations, got {len(responses)}"
+        # Record timestamp before sending requests for log filtering
+        since_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+        time.sleep(1)
 
-            time.sleep(2)
+        responses = self._send_user_requests(api_url, 10)
+        assert len(responses) == 10, f"Expected 10 successful creations, got {len(responses)}"
 
-            v1_logs = self._get_logs("user-service-v1", since=since)
-            v2_logs = self._get_logs("user-service-v2", since=since)
+        time.sleep(2)
 
-            # Count POST requests in logs
-            v1_posts = v1_logs.count("POST /users/")
-            v2_posts = v2_logs.count("POST /users/")
+        v1_logs = self._get_logs_since("user-service-v1", since_time)
+        v2_logs = self._get_logs_since("user-service-v2", since_time)
 
-            assert v1_posts >= 8, f"Expected most requests in v1 logs, found {v1_posts}"
-            assert v2_posts == 0, f"Expected no requests in v2 logs, found {v2_posts}"
+        v1_posts = v1_logs.count("POST /users/")
+        v2_posts = v2_logs.count("POST /users/")
 
-            # v1 does NOT set createdAt
-            for resp in responses:
-                assert resp.get("createdAt") is None, "v1 should not set createdAt"
-        finally:
-            self._rebuild_kong(original_p)
+        assert v1_posts >= 8, f"Expected most requests in v1 logs, found {v1_posts}"
+        assert v2_posts == 0, f"Expected no requests in v2 logs, found {v2_posts}"
+
+        # v1 does NOT set createdAt
+        for resp in responses:
+            assert resp.get("createdAt") is None, "v1 should not set createdAt"
 
     def test_scenario_b_all_traffic_to_v2(self, api_url):
         """Scenario B: P_VALUE=0 -> all traffic to v2."""
-        original_p = self._read_p_value()
-        try:
-            self._rebuild_kong(0)
-            since = self._clear_logs()
+        self._set_p_value(0)
+        self._rebuild_and_restart_kong()
 
-            responses = self._send_user_requests(api_url, 10)
-            assert len(responses) == 10, f"Expected 10 successful creations, got {len(responses)}"
+        since_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+        time.sleep(1)
 
-            time.sleep(2)
+        responses = self._send_user_requests(api_url, 10)
+        assert len(responses) == 10, f"Expected 10 successful creations, got {len(responses)}"
 
-            v1_logs = self._get_logs("user-service-v1", since=since)
-            v2_logs = self._get_logs("user-service-v2", since=since)
+        time.sleep(2)
 
-            v1_posts = v1_logs.count("POST /users/")
-            v2_posts = v2_logs.count("POST /users/")
+        v1_logs = self._get_logs_since("user-service-v1", since_time)
+        v2_logs = self._get_logs_since("user-service-v2", since_time)
 
-            assert v1_posts == 0, f"Expected no requests in v1 logs, found {v1_posts}"
-            assert v2_posts >= 8, f"Expected most requests in v2 logs, found {v2_posts}"
+        v1_posts = v1_logs.count("POST /users/")
+        v2_posts = v2_logs.count("POST /users/")
 
-            # v2 DOES set createdAt
-            for resp in responses:
-                assert resp.get("createdAt") is not None, "v2 should set createdAt"
-        finally:
-            self._rebuild_kong(original_p)
+        assert v1_posts == 0, f"Expected no requests in v1 logs, found {v1_posts}"
+        assert v2_posts >= 8, f"Expected most requests in v2 logs, found {v2_posts}"
+
+        # v2 DOES set createdAt
+        for resp in responses:
+            assert resp.get("createdAt") is not None, "v2 should set createdAt"
 
     def test_scenario_c_50_50_split(self, api_url):
         """Scenario C: P_VALUE=50 -> roughly 50/50 split."""
-        original_p = self._read_p_value()
-        try:
-            self._rebuild_kong(50)
-            self._clear_logs()
+        self._set_p_value(50)
+        self._rebuild_and_restart_kong()
 
-            responses = self._send_user_requests(api_url, 20)
-            assert len(responses) == 20, f"Expected 20 successful creations, got {len(responses)}"
+        responses = self._send_user_requests(api_url, 20)
+        assert len(responses) == 20, f"Expected 20 successful creations, got {len(responses)}"
 
-            # Count how many have createdAt set (v2) vs not set (v1)
-            v2_count = sum(1 for r in responses if r.get("createdAt") is not None)
-            v1_count = len(responses) - v2_count
+        # Count how many have createdAt set (v2) vs not set (v1)
+        v2_count = sum(1 for r in responses if r.get("createdAt") is not None)
+        v1_count = len(responses) - v2_count
 
-            # Allow generous tolerance for small sample: between 20% and 80%
-            assert v1_count >= 4, f"Expected at least 4 requests to v1, got {v1_count}"
-            assert v2_count >= 4, f"Expected at least 4 requests to v2, got {v2_count}"
-        finally:
-            self._rebuild_kong(original_p)
+        # Allow generous tolerance for small sample: between 20% and 80%
+        assert v1_count >= 4, f"Expected at least 4 requests to v1, got {v1_count}"
+        assert v2_count >= 4, f"Expected at least 4 requests to v2, got {v2_count}"
