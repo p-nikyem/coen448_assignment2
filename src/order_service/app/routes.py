@@ -135,7 +135,7 @@ class OrderStatus(Resource):
                                      enum=['under process', 'shipping', 'delivered'])
     }))
     @api.marshal_with(order_model)
-    def put(self) -> dict:
+    def put(self, id: str) -> dict:
         """
         Update the status of an existing order based on the provided order ID.
         Args:
@@ -178,7 +178,7 @@ class OrderDetails(Resource):
                                          'The delivery address of the user')
     }))
     @api.marshal_with(order_model)
-    def put(self) -> dict:
+    def put(self, id: str) -> dict:
         """
         Update the emails or delivery address of an existing order based on the provided 
         order ID.
