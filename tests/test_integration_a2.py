@@ -224,7 +224,15 @@ class TestTC02OrderCreation:
         orders = get_resp.json()
         order_ids = [o["orderId"] for o in orders]
         assert order_id in order_ids, "Order not found under 'shipping' status"
-        
+
+    def test_order_exists_in_mongodb(self, created_order, mongo):
+        """Step 8: Order document exists in MongoDB and fields match."""
+        _, orders_col = mongo
+        db_order = orders_col.find_one({"orderId": created_order["orderId"]})
+        assert db_order is not None, "Order not found in MongoDB"
+        assert db_order["items"][0]["itemId"] == "ITEM001"
+        assert db_order["userEmails"] == created_order["userEmails"]
+
     def test_update_order_details(self, api_url, created_order, mongo):
         """Req 1.8: PUT /orders/{id}/details updates order email and address."""
         _, orders_col = mongo
@@ -253,14 +261,7 @@ class TestTC02OrderCreation:
             f"Order email not updated. Got: {db_order['userEmails']}"
         assert db_order["deliveryAddress"]["street"] == "999 Peel St", \
             f"Order address not updated. Got: {db_order['deliveryAddress']['street']}"
-    def test_order_exists_in_mongodb(self, created_order, mongo):
-        """Step 8: Order document exists in MongoDB and fields match."""
-        _, orders_col = mongo
-        db_order = orders_col.find_one({"orderId": created_order["orderId"]})
-        assert db_order is not None, "Order not found in MongoDB"
-        assert db_order["items"][0]["itemId"] == "ITEM001"
-        assert db_order["userEmails"] == created_order["userEmails"]
-
+    
 
 # ---------------------------------------------------------------------------
 # TC_03: Validate Event-Driven User Update Propagation
