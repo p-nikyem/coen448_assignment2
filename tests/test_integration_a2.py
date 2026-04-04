@@ -176,7 +176,7 @@ class TestTC01UserCreation:
 
 # ---------------------------------------------------------------------------
 # TC_02: Validate Order Creation with Existing User
-# Linked to Requirements: 1.5, 1.6, 1.10, 3.3
+# Linked to Requirements: 1.5, 1.6, 1.8, 1.10, 3.3
 # ---------------------------------------------------------------------------
 
 class TestTC02OrderCreation:
@@ -224,7 +224,35 @@ class TestTC02OrderCreation:
         orders = get_resp.json()
         order_ids = [o["orderId"] for o in orders]
         assert order_id in order_ids, "Order not found under 'shipping' status"
+        
+    def test_update_order_details(self, api_url, created_order, mongo):
+        """Req 1.8: PUT /orders/{id}/details updates order email and address."""
+        _, orders_col = mongo
+        order_id = created_order["orderId"]
 
+        new_details = {
+            "userEmails": ["tc02_details_updated@test.com"],
+            "deliveryAddress": {
+                "street": "999 Peel St",
+                "city": "Montreal",
+                "state": "QC",
+                "postalCode": "H3A1X1",
+                "country": "Canada"
+            }
+        }
+
+        resp = requests.put(
+            f"{api_url}/orders/{order_id}/details",
+            json=new_details
+        )
+        assert resp.status_code == 200, f"Order details update failed: {resp.text}"
+
+        # Verify update in MongoDB
+        db_order = orders_col.find_one({"orderId": order_id})
+        assert db_order["userEmails"] == ["tc02_details_updated@test.com"], \
+            f"Order email not updated. Got: {db_order['userEmails']}"
+        assert db_order["deliveryAddress"]["street"] == "999 Peel St", \
+            f"Order address not updated. Got: {db_order['deliveryAddress']['street']}"
     def test_order_exists_in_mongodb(self, created_order, mongo):
         """Step 8: Order document exists in MongoDB and fields match."""
         _, orders_col = mongo
