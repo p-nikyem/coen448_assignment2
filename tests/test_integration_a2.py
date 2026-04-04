@@ -479,7 +479,58 @@ class TestTC04GatewayRouting:
         # v2 DOES set createdAt
         for resp in responses:
             assert resp.get("createdAt") is not None, "v2 should set createdAt"
+            
+    def test_v2_timestamps_on_create_and_update(self, api_url, mongo):
+        """Req 1.3/1.4: v2 POST sets createdAt/updatedAt; v2 PUT updates updatedAt."""
+        users_col, _ = mongo
 
+        # Ensure Kong routes to v2
+        self._set_p_value(0)
+        self._rebuild_and_restart_kong()
+
+        # Step 1: Create user via v2 — verify createdAt and updatedAt are set
+        payload = {
+            "emails": [f"tc04_ts_{uuid.uuid4().hex[:8]}@test.com"],
+            "deliveryAddress": {
+                "street": "300 University St",
+                "city": "Montreal",
+                "state": "QC",
+                "postalCode": "H3A2A7",
+                "country": "Canada"
+            }
+        }
+        create_resp = requests.post(f"{api_url}/users/", json=payload)
+        assert create_resp.status_code == 201, f"v2 user creation failed: {create_resp.text}"
+        created = create_resp.json()
+
+        assert created.get("createdAt") is not None, \
+            "Req 1.3: v2 POST should set createdAt"
+        assert created.get("updatedAt") is not None, \
+            "Req 1.3: v2 POST should set updatedAt"
+
+        created_at_before = created["createdAt"]
+        updated_at_before = created["updatedAt"]
+
+        # Small delay to ensure timestamp difference is observable
+        time.sleep(1)
+
+        # Step 2: Update user via v2 — verify updatedAt changes
+        user_id = created["userId"]
+        update_resp = requests.put(
+            f"{api_url}/users/{user_id}",
+            json={"emails": [f"tc04_ts_upd_{uuid.uuid4().hex[:8]}@test.com"]}
+        )
+        assert update_resp.status_code == 200, f"v2 user update failed: {update_resp.text}"
+
+        result = update_resp.json()
+        new_user = result[1] if isinstance(result, list) else result
+
+        assert new_user.get("updatedAt") is not None, \
+            "Req 1.4: v2 PUT should set updatedAt"
+        assert new_user["updatedAt"] != updated_at_before, \
+            f"Req 1.4: updatedAt should change after PUT. Before: {updated_at_before}, After: {new_user['updatedAt']}"
+        assert new_user.get("createdAt") == created_at_before, \
+            "Req 1.4: createdAt should NOT change after PUT"
     def test_scenario_c_50_50_split(self, api_url):
         """Scenario C: P_VALUE=50 -> roughly 50/50 split."""
         self._set_p_value(50)
